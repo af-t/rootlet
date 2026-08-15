@@ -801,7 +801,10 @@ static void exec_session(int slave)
    stays in the host PID namespace to reap PID 1 and forward its exit status.
    /proc must be remounted from inside the new PID namespace for `ps` to show
    the container view, and the mount namespace is made private so that remount
-   does not propagate to the host. */
+   does not propagate to the host. When the namespaces cannot be set up (e.g. a
+   kernel built without CONFIG_PID_NS), it warns and returns so the caller runs
+   a plain, non-isolated session rather than discarding the mount and pty setup
+   already done. */
 static void enter_namespaces(int slave)
 {
   pid_t leaf;
@@ -813,11 +816,12 @@ static void enter_namespaces(int slave)
   if (unshare(CLONE_NEWNS | CLONE_NEWPID) != 0) {
     if (errno == EINVAL)
       fprintf(stderr, "unshare: %s (kernel built without "
-        "CONFIG_PID_NS; -p is unsupported here)\n",
+        "CONFIG_PID_NS); continuing without namespace isolation\n",
         strerror(errno));
     else
-      fprintf(stderr, "unshare: %s\n", strerror(errno));
-    _exit(125);
+      fprintf(stderr, "unshare: %s; continuing without namespace "
+        "isolation\n", strerror(errno));
+    return;
   }
 
   if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0)
@@ -825,8 +829,9 @@ static void enter_namespaces(int slave)
 
   leaf = fork();
   if (leaf < 0) {
-    fprintf(stderr, "fork: %s\n", strerror(errno));
-    _exit(125);
+    fprintf(stderr, "fork: %s; continuing without namespace "
+      "isolation\n", strerror(errno));
+    return;
   }
 
   if (leaf > 0) {
