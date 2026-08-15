@@ -5,7 +5,9 @@ built for Android. It attaches an image to a loop device, mounts its root
 filesystem, binds the host `/dev`, `/proc`, `/sys` and `/sdcard` into it, then
 `chroot`s in and starts a login shell (`su -`) on its own pseudo-terminal.
 On exit it tears everything back down: it kills the session's processes,
-unmounts, and detaches the loop device.
+unmounts, and detaches the loop device. The same teardown runs when rootlet is
+terminated with `SIGTERM` or `SIGHUP`, or when a run fails partway. It exits
+with the session's own status.
 
 ## Build
 

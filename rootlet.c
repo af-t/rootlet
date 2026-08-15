@@ -26,6 +26,7 @@
 #define DEFAULT_MOUNT "/mnt/ubuntu"
 #define DEFAULT_SU "/usr/bin/su"
 #define TERM_GRACE_SECONDS 3
+#define SESSION_DRAIN_MS 200
 #define MAX_BINDS 64
 
 /* An extra host path to bind into the chroot. "guest" is the absolute path
@@ -36,8 +37,13 @@ struct bind {
 };
 
 static char distro_path[PATH_MAX];
-static char chroot_path[PATH_MAX];
+/* Short enough that every subpath cp() appends to it still fits in PATH_MAX,
+   so no path this program builds is ever silently truncated. */
+static char chroot_path[PATH_MAX - 256];
 static size_t chroot_len;
+/* The shallowest directory the teardown may remove: the mount point itself, or
+   the topmost parent this run had to create for it. */
+static size_t chroot_created;
 static const char *su_path = DEFAULT_SU;
 static struct bind binds[MAX_BINDS];
 static size_t bind_count;
@@ -46,6 +52,10 @@ static int loop_fd = -1;
 static int lock_fd = -1;
 static int ns_enabled;
 static int debug_enabled;
+static int rootfs_mounted;
+static int cleanup_done;
+static volatile sig_atomic_t session_gone;
+static volatile sig_atomic_t stop_signal;
 
 /* Build "<chroot_path><sub>" into one of a few rotating buffers, so a single
    expression can safely hold more than one result at a time. */
@@ -79,7 +89,10 @@ static void die(const char *what)
   exit(1);
 }
 
-static int mkdir_p(const char *path)
+/* Creates every missing component of "path". When "created" is not NULL it is
+   lowered to the length of the shallowest component this call had to create;
+   components are made shallowest first, so only the first one can lower it. */
+static int mkdir_p(const char *path, size_t *created)
 {
   char buf[PATH_MAX];
   char *p;
@@ -93,13 +106,21 @@ static int mkdir_p(const char *path)
     if (*p != '/')
       continue;
     *p = '\0';
-    if (mkdir(buf, 0755) != 0 && errno != EEXIST)
-      return -1;
+    if (mkdir(buf, 0755) != 0) {
+      if (errno != EEXIST)
+        return -1;
+    } else if (created && strlen(buf) < *created) {
+      *created = strlen(buf);
+    }
     *p = '/';
   }
 
-  if (mkdir(buf, 0755) != 0 && errno != EEXIST)
-    return -1;
+  if (mkdir(buf, 0755) != 0) {
+    if (errno != EEXIST)
+      return -1;
+  } else if (created && strlen(buf) < *created) {
+    *created = strlen(buf);
+  }
 
   return 0;
 }
@@ -218,6 +239,7 @@ static int try_mount_rootfs(const char *type)
 {
   if (mount(loop_node, chroot_path, type, 0, NULL) == 0) {
     dbg("mounted %s on %s as %s", loop_node, chroot_path, type);
+    rootfs_mounted = 1;
     return 1;
   }
 
@@ -273,7 +295,6 @@ static void mount_rootfs(void)
   }
 
   fprintf(stderr, "mount rootfs failed: unrecognized filesystem\n");
-  loop_detach();
   exit(1);
 }
 
@@ -286,14 +307,40 @@ static void mount_soft(const char *source, const char *target,
     dbg("mount ok: %s", target);
 }
 
+/* Reports one path inside the image. Symlinks are shown rather than followed:
+   an absolute link resolves against the host from out here, so following it
+   would report a missing file for a binary that execs fine after the chroot. */
+static void probe_path(const char *path)
+{
+  char target[PATH_MAX];
+  struct stat st;
+  ssize_t len;
+
+  if (lstat(path, &st) != 0) {
+    dbg("%s: %s", path, strerror(errno));
+    return;
+  }
+
+  if (S_ISLNK(st.st_mode)) {
+    len = readlink(path, target, sizeof(target) - 1);
+    if (len < 0) {
+      dbg("%s: readlink: %s", path, strerror(errno));
+      return;
+    }
+    target[len] = '\0';
+    dbg("%s -> %s", path, target);
+    return;
+  }
+
+  dbg("%s: mode=%04o size=%lld", path, (unsigned)(st.st_mode & 07777),
+      (long long)st.st_size);
+}
+
 /* Debug-only survey of what the image actually contains, which is the
    information needed when the session binary fails to exec. */
 static void probe_rootfs(void)
 {
   struct dirent *ent;
-  struct stat st;
-  const char *inst;
-  const char *alt;
   int shown = 0;
   DIR *dir;
 
@@ -314,19 +361,8 @@ static void probe_rootfs(void)
   }
   closedir(dir);
 
-  inst = cp(su_path);
-  if (stat(inst, &st) == 0)
-    dbg("%s: mode=%04o size=%lld", inst,
-        (unsigned)(st.st_mode & 07777), (long long)st.st_size);
-  else
-    dbg("%s: %s", inst, strerror(errno));
-
-  alt = cp("/bin/su");
-  if (stat(alt, &st) == 0)
-    dbg("%s: mode=%04o size=%lld", alt,
-        (unsigned)(st.st_mode & 07777), (long long)st.st_size);
-  else
-    dbg("%s: %s", alt, strerror(errno));
+  probe_path(cp(su_path));
+  probe_path(cp("/bin/su"));
 }
 
 /* User-requested binds from -b, applied after the fixed ones. The target
@@ -339,7 +375,7 @@ static void mount_binds(void)
   for (i = 0; i < bind_count; i++) {
     const char *target = cp(binds[i].guest);
 
-    if (mkdir_p(target) != 0) {
+    if (mkdir_p(target, NULL) != 0) {
       fprintf(stderr, "mkdir %s: %s\n", target, strerror(errno));
       continue;
     }
@@ -379,7 +415,7 @@ static void do_mount(void)
 
   loop_attach();
 
-  if (mkdir_p(chroot_path) != 0)
+  if (mkdir_p(chroot_path, &chroot_created) != 0)
     die(chroot_path);
 
   mount_rootfs();
@@ -392,7 +428,7 @@ static void do_mount(void)
   mount_soft("tmpfs", cp("/tmp"), "tmpfs", 0, "size=50%,mode=1777");
 
   sdcard = cp("/mnt/sdcard");
-  if (mkdir_p(sdcard) != 0)
+  if (mkdir_p(sdcard, NULL) != 0)
     fprintf(stderr, "mkdir %s: %s\n", sdcard, strerror(errno));
   else
     mount_soft("/sdcard", sdcard, NULL, MS_BIND, NULL);
@@ -458,10 +494,46 @@ static void do_umount(void)
   umount_soft(cp("/tmp"));
 
   umount_soft(chroot_path);
+}
+
+/* Removes the mount point and every parent this run created for it. A
+   directory that was already there, or that is not empty, simply stays. */
+static void remove_mountpoint(void)
+{
+  char buf[PATH_MAX];
+  size_t len = chroot_len;
+
+  memcpy(buf, chroot_path, chroot_len + 1);
+
+  for (;;) {
+    buf[len] = '\0';
+    if (rmdir(buf) != 0)
+      return;
+
+    while (len > 0 && buf[len - 1] != '/')
+      len--;
+    if (len < 2)
+      return;
+    len--;                      /* drop the separator */
+    if (len < chroot_created)   /* this parent was not ours to remove */
+      return;
+  }
+}
+
+/* Undoes whatever has been set up so far. Registered with atexit(), so a
+   die() once the image is attached still releases the loop device and the
+   mounts instead of leaving them behind. */
+static void cleanup(void)
+{
+  if (cleanup_done)
+    return;
+  cleanup_done = 1;
+
+  if (rootfs_mounted)
+    do_umount();
 
   loop_detach();
-
-  rmdir(chroot_path);
+  remove_mountpoint();
 }
 
 static int path_in_chroot(const char *path)
@@ -603,6 +675,19 @@ static void on_winch(int sig)
   winch_pending = 1;
 }
 
+/* Both handlers only raise a flag: the teardown belongs on the main path, and
+   a stop signal must not skip it the way the default disposition would. */
+static void on_stop(int sig)
+{
+  stop_signal = sig;
+}
+
+static void on_session_exit(int sig)
+{
+  (void)sig;
+  session_gone = 1;
+}
+
 static void push_window_size(int master)
 {
   struct winsize ws;
@@ -699,21 +784,56 @@ static int write_all(int fd, const char *buf, size_t len)
   return 0;
 }
 
+/* Milliseconds left until "deadline", never negative. */
+static int ms_until(const struct timespec *deadline)
+{
+  struct timespec now;
+  long ms;
+
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  ms = (deadline->tv_sec - now.tv_sec) * 1000 +
+       (deadline->tv_nsec - now.tv_nsec) / 1000000;
+
+  return ms > 0 ? (int)ms : 0;
+}
+
 static void relay(int master)
 {
+  struct timespec drain_until;
   struct pollfd fds[2];
   char buf[4096];
   int stdin_open = 1;
+  int draining = 0;
 
   signal(SIGWINCH, on_winch);
 
   for (;;) {
+    int timeout = -1;
     ssize_t r;
+
+    if (stop_signal)
+      break;
 
     if (winch_pending) {
       winch_pending = 0;
       push_window_size(master);
     }
+
+    /* The master only reports end of file once every slave is closed, and a
+       process the session left behind can hold one open for as long as it
+       likes. So once the session itself is gone, take what the pty still has
+       and leave; whatever is left running is dealt with by the caller. */
+    if (session_gone && !draining) {
+      clock_gettime(CLOCK_MONOTONIC, &drain_until);
+      drain_until.tv_nsec += SESSION_DRAIN_MS * 1000000L;
+      if (drain_until.tv_nsec >= 1000000000L) {
+        drain_until.tv_nsec -= 1000000000L;
+        drain_until.tv_sec++;
+      }
+      draining = 1;
+    }
+    if (draining)
+      timeout = ms_until(&drain_until);
 
     fds[0].fd = stdin_open ? STDIN_FILENO : -1;
     fds[0].events = POLLIN;
@@ -722,11 +842,14 @@ static void relay(int master)
     fds[1].events = POLLIN;
     fds[1].revents = 0;
 
-    if (poll(fds, 2, -1) < 0) {
+    r = poll(fds, 2, timeout);
+    if (r < 0) {
       if (errno == EINTR)
         continue;
       break;
     }
+    if (r == 0)   /* only reachable while draining: nothing left to read */
+      break;
 
     if (fds[1].revents) {
       r = read(master, buf, sizeof(buf));
@@ -849,13 +972,25 @@ static void enter_namespaces(int slave)
     fprintf(stderr, "mount proc: %s\n", strerror(errno));
 }
 
-static void run_session(void)
+/* Returns the status to exit with: the session's own, or 128 + signal when it
+   was killed or when a stop signal cut the session short. */
+static int run_session(void)
 {
+  struct sigaction chld;
   int master, slave;
   pid_t pid, done;
   int status;
 
   open_pty(&master, &slave);
+
+  /* Installed before the fork so a session that exits immediately cannot go
+     unnoticed and leave relay() waiting on the pty. SA_NOCLDSTOP keeps a
+     session that is merely stopped from counting as a finished one. */
+  memset(&chld, 0, sizeof(chld));
+  chld.sa_handler = on_session_exit;
+  chld.sa_flags = SA_NOCLDSTOP;
+  sigemptyset(&chld.sa_mask);
+  sigaction(SIGCHLD, &chld, NULL);
 
   pid = fork();
   if (pid < 0)
@@ -881,16 +1016,29 @@ static void run_session(void)
   raw_mode_leave();
   close(master);
 
+  /* After a stop signal the session is still running, and ending it is left
+     to kill_chroot_processes(), so this must not block on it. */
   do {
-    done = waitpid(pid, &status, 0);
+    done = waitpid(pid, &status, stop_signal ? WNOHANG : 0);
   } while (done < 0 && errno == EINTR);
 
-  if (done < 0)
+  signal(SIGCHLD, SIG_DFL);
+
+  if (done < 0) {
     dbg("waitpid: %s", strerror(errno));
-  else if (WIFSIGNALED(status))
+    return 125;
+  }
+  if (done == 0) {
+    dbg("stopping on signal %d, session still running", (int)stop_signal);
+    return 128 + (int)stop_signal;
+  }
+  if (WIFSIGNALED(status)) {
     dbg("session killed by signal %d", WTERMSIG(status));
-  else
-    dbg("session exited with %d", WEXITSTATUS(status));
+    return 128 + WTERMSIG(status);
+  }
+
+  dbg("session exited with %d", WEXITSTATUS(status));
+  return WEXITSTATUS(status);
 }
 
 static void usage(const char *prog)
@@ -915,6 +1063,7 @@ int main(int argc, char **argv)
   const char *image = NULL;
   const char *mount_at = DEFAULT_MOUNT;
   size_t len;
+  int status;
   int opt;
 
   debug_enabled = getenv("DEBUG") != NULL;
@@ -1007,19 +1156,35 @@ int main(int argc, char **argv)
   memcpy(chroot_path, mount_at, len);
   chroot_path[len] = '\0';
   chroot_len = len;
+  chroot_created = len;
 
   dbg("image=%s", distro_path);
   dbg("mount=%s", chroot_path);
   dbg("login=%s", su_path);
 
   acquire_lock();
+
+  if (atexit(cleanup) != 0) {
+    fprintf(stderr, "cannot register the teardown\n");
+    return 1;
+  }
+  signal(SIGTERM, on_stop);
+  signal(SIGHUP, on_stop);
+
   do_mount();
-  run_session();
+  status = run_session();
   kill_chroot_processes();
-  do_umount();
+  cleanup();
 
   if (lock_fd >= 0)
     close(lock_fd);
 
-  return 0;
+  /* Die from the stop signal the way a program without a handler would, now
+     that the teardown it would have skipped is done. */
+  if (stop_signal) {
+    signal(stop_signal, SIG_DFL);
+    raise(stop_signal);
+  }
+
+  return status;
 }
