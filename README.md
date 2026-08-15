@@ -32,8 +32,15 @@ Options:
 -s login        login program run inside the chroot (default /usr/bin/su)
 -b host[:guest] bind host path into the chroot at guest; guest defaults to
                 host and must be absolute. Repeatable.
+-p              run the session in new PID and mount namespaces
 -d              enable debug output (same as DEBUG=1)
 ```
+
+With `-p` the session runs in fresh PID and mount namespaces: `/proc` is
+remounted from inside the new PID namespace, so `ps` in the chroot sees only
+the container's own processes (the login shell is PID 1) and the extra mount
+stays private to the session. Networking and hostname remain shared with the
+host.
 
 Besides the standard binds (`/dev`, `/proc`, `/sys`, `/sdcard`, …), `-b`
 adds extra ones the same way proot does, and the target directory is created

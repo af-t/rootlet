@@ -5,11 +5,13 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/mount.h>
 #include <sys/stat.h>
@@ -41,6 +43,8 @@ static struct bind binds[MAX_BINDS];
 static size_t bind_count;
 static char loop_node[32];
 static int loop_fd = -1;
+static int lock_fd = -1;
+static int ns_enabled;
 static int debug_enabled;
 
 /* Build "<chroot_path><sub>" into one of a few rotating buffers, so a single
@@ -341,6 +345,32 @@ static void mount_binds(void)
     }
     mount_soft(binds[i].host, target, NULL, MS_BIND, NULL);
   }
+}
+
+/* Serialize instances that share an image. Two concurrent runs would race in
+   do_mount/do_umount, and mounting the same read-write image twice corrupts
+   its filesystem. The advisory lock rides on the image's open file
+   description, so it releases automatically when this process exits or
+   crashes; O_CLOEXEC keeps it from leaking into the session's shell while the
+   main process holds it for the whole run. */
+static void acquire_lock(void)
+{
+  int fd = open(distro_path, O_RDONLY | O_CLOEXEC);
+
+  if (fd < 0)
+    die(distro_path);
+
+  if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+    if (errno == EWOULDBLOCK)
+      fprintf(stderr, "%s: already in use by another rootlet\n",
+        distro_path);
+    else
+      fprintf(stderr, "flock %s: %s\n", distro_path, strerror(errno));
+    exit(1);
+  }
+
+  lock_fd = fd;
+  dbg("locked %s", distro_path);
 }
 
 static void do_mount(void)
@@ -723,11 +753,99 @@ static void relay(int master)
   signal(SIGWINCH, SIG_DFL);
 }
 
-static void run_session(void)
+/* Runs in the process that becomes the session: takes the pty as its
+   controlling terminal, enters the chroot, and execs the login program.
+   Never returns. */
+static void exec_session(int slave)
 {
   const char *base = strrchr(su_path, '/');
   char *const session_argv[] = { (char *)(base ? base + 1 : su_path),
                                  "-", NULL };
+
+  signal(SIGINT, SIG_DFL);
+  signal(SIGQUIT, SIG_DFL);
+
+  attach_pty(slave);
+
+  if (chdir(chroot_path) != 0 || chroot(chroot_path) != 0 ||
+      chdir("/") != 0) {
+    fprintf(stderr, "chroot %s: %s\n", chroot_path, strerror(errno));
+    _exit(125);
+  }
+
+  unsetenv("LD_PRELOAD");
+  unsetenv("LD_LIBRARY_PATH");
+
+  dbg("chroot ok, exec %s", su_path);
+
+  /* Go straight to the syscall. A preloaded library inherited from the
+     launching shell (Termux's libtermux-exec) interposes execve() and
+     rewrites the path to a prefix that does not exist inside the chroot. It
+     is already mapped into this process, so clearing the environment above
+     cannot disarm it. */
+  syscall(SYS_execve, su_path, session_argv, environ);
+
+  /* execve reports ENOENT both for a missing binary and for a binary whose
+     ELF interpreter is missing. */
+  if (errno == ENOENT && access(su_path, F_OK) == 0)
+    fprintf(stderr, "exec %s: file exists, its ELF interpreter is "
+      "missing\n", su_path);
+  else
+    fprintf(stderr, "exec %s: %s\n", su_path, strerror(errno));
+  _exit(126);
+}
+
+/* With -p the session runs in fresh PID and mount namespaces so it sees only
+   its own processes. unshare(CLONE_NEWPID) places the *next* child in the new
+   namespace as PID 1, so an intermediate fork is needed; that intermediate
+   stays in the host PID namespace to reap PID 1 and forward its exit status.
+   /proc must be remounted from inside the new PID namespace for `ps` to show
+   the container view, and the mount namespace is made private so that remount
+   does not propagate to the host. */
+static void enter_namespaces(int slave)
+{
+  pid_t leaf;
+  int status;
+
+  signal(SIGINT, SIG_IGN);
+  signal(SIGQUIT, SIG_IGN);
+
+  if (unshare(CLONE_NEWNS | CLONE_NEWPID) != 0) {
+    if (errno == EINVAL)
+      fprintf(stderr, "unshare: %s (kernel built without "
+        "CONFIG_PID_NS; -p is unsupported here)\n",
+        strerror(errno));
+    else
+      fprintf(stderr, "unshare: %s\n", strerror(errno));
+    _exit(125);
+  }
+
+  if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0)
+    fprintf(stderr, "make private: %s\n", strerror(errno));
+
+  leaf = fork();
+  if (leaf < 0) {
+    fprintf(stderr, "fork: %s\n", strerror(errno));
+    _exit(125);
+  }
+
+  if (leaf > 0) {
+    close(slave);
+    while (waitpid(leaf, &status, 0) < 0 && errno == EINTR)
+      ;
+    if (WIFSIGNALED(status))
+      _exit(128 + WTERMSIG(status));
+    _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 125);
+  }
+
+  /* leaf: PID 1 in the new namespace. Remount proc here so it reflects this
+     PID namespace instead of the host one already mounted by do_mount. */
+  if (mount("proc", cp("/proc"), "proc", 0, NULL) != 0)
+    fprintf(stderr, "mount proc: %s\n", strerror(errno));
+}
+
+static void run_session(void)
+{
   int master, slave;
   pid_t pid, done;
   int status;
@@ -739,40 +857,10 @@ static void run_session(void)
     die("fork");
 
   if (pid == 0) {
-    signal(SIGINT, SIG_DFL);
-    signal(SIGQUIT, SIG_DFL);
-
     close(master);
-    attach_pty(slave);
-
-    if (chdir(chroot_path) != 0 || chroot(chroot_path) != 0 ||
-        chdir("/") != 0) {
-      fprintf(stderr, "chroot %s: %s\n", chroot_path,
-        strerror(errno));
-      _exit(125);
-    }
-
-    unsetenv("LD_PRELOAD");
-    unsetenv("LD_LIBRARY_PATH");
-
-    dbg("chroot ok, exec %s", su_path);
-
-    /* Go straight to the syscall. A preloaded library inherited from
-       the launching shell (Termux's libtermux-exec) interposes
-       execve() and rewrites the path to a prefix that does not exist
-       inside the chroot. It is already mapped into this process, so
-       clearing the environment above cannot disarm it. */
-    syscall(SYS_execve, su_path, session_argv, environ);
-
-    /* execve reports ENOENT both for a missing binary and for a
-       binary whose ELF interpreter is missing. */
-    if (errno == ENOENT && access(su_path, F_OK) == 0)
-      fprintf(stderr, "exec %s: file exists, its ELF "
-        "interpreter is missing\n", su_path);
-    else
-      fprintf(stderr, "exec %s: %s\n", su_path,
-        strerror(errno));
-    _exit(126);
+    if (ns_enabled)
+      enter_namespaces(slave);
+    exec_session(slave);
   }
 
   /* Keep the cleanup path reachable when the session is interrupted. */
@@ -804,13 +892,14 @@ static void usage(const char *prog)
 {
   fprintf(stderr,
     "usage: %s [-i image] [-m mountpoint] [-s login] "
-    "[-b host[:guest]]... [-d]\n"
+    "[-b host[:guest]]... [-p] [-d]\n"
     "  -i image        distro image file (default $HOME/distro.img)\n"
     "  -m mountpoint   absolute path to mount and chroot into "
     "(default %s)\n"
     "  -s login        login program run inside the chroot (default %s)\n"
     "  -b host[:guest] bind host path into the chroot at guest\n"
     "                  (guest defaults to host); repeatable\n"
+    "  -p              run the session in new PID and mount namespaces\n"
     "  -d              enable debug output (same as DEBUG=1)\n",
     prog, DEFAULT_MOUNT, DEFAULT_SU);
 }
@@ -825,7 +914,7 @@ int main(int argc, char **argv)
 
   debug_enabled = getenv("DEBUG") != NULL;
 
-  while ((opt = getopt(argc, argv, "i:m:s:b:dh")) != -1) {
+  while ((opt = getopt(argc, argv, "i:m:s:b:pdh")) != -1) {
     switch (opt) {
     case 'i':
       image = optarg;
@@ -859,6 +948,9 @@ int main(int argc, char **argv)
       bind_count++;
       break;
     }
+    case 'p':
+      ns_enabled = 1;
+      break;
     case 'd':
       debug_enabled = 1;
       break;
@@ -915,10 +1007,14 @@ int main(int argc, char **argv)
   dbg("mount=%s", chroot_path);
   dbg("login=%s", su_path);
 
+  acquire_lock();
   do_mount();
   run_session();
   kill_chroot_processes();
   do_umount();
+
+  if (lock_fd >= 0)
+    close(lock_fd);
 
   return 0;
 }
