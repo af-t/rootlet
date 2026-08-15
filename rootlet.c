@@ -409,9 +409,69 @@ static void acquire_lock(void)
   dbg("locked %s", distro_path);
 }
 
+/* mountinfo escapes space, tab, newline and backslash as octal, so a field has
+   to be decoded before it can be compared with a real path. */
+static void unescape_octal(char *s)
+{
+  char *out = s;
+
+  while (*s) {
+    if (s[0] == '\\' && s[1] >= '0' && s[1] <= '3' &&
+        s[2] >= '0' && s[2] <= '7' && s[3] >= '0' && s[3] <= '7') {
+      *out++ = (char)(((s[1] - '0') << 6) | ((s[2] - '0') << 3) |
+           (s[3] - '0'));
+      s += 4;
+      continue;
+    }
+    *out++ = *s++;
+  }
+
+  *out = '\0';
+}
+
+/* The image lock covers the image, not the directory it is mounted on, so two
+   runs with different images could stack on one mount point. The teardown of
+   whichever left first would then match the other session's processes by path
+   and kill them. Refusing a directory that is already a mount point avoids
+   that, and also catches what a run that was killed outright left behind. */
+static int mount_point_busy(void)
+{
+  char line[PATH_MAX * 2];
+  int busy = 0;
+  FILE *fp;
+
+  fp = fopen("/proc/self/mountinfo", "r");
+  if (!fp)
+    return 0;
+
+  while (!busy && fgets(line, sizeof(line), fp)) {
+    char *field = line;
+    int i;
+
+    /* The mount point is the fifth space separated field. */
+    for (i = 0; i < 4; i++) {
+      field += strcspn(field, " ");
+      field += strspn(field, " ");
+    }
+    field[strcspn(field, " \r\n")] = '\0';
+
+    unescape_octal(field);
+    busy = strcmp(field, chroot_path) == 0;
+  }
+
+  fclose(fp);
+  return busy;
+}
+
 static void do_mount(void)
 {
   const char *sdcard;
+
+  if (mount_point_busy()) {
+    fprintf(stderr, "%s: already a mount point, unmount it first\n",
+      chroot_path);
+    exit(1);
+  }
 
   loop_attach();
 

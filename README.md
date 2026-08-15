@@ -45,9 +45,8 @@ stays private to the session. Networking and hostname remain shared with the
 host. If the kernel lacks PID namespace support, rootlet prints a warning and
 falls back to a normal (non-isolated) session.
 
-Besides the standard binds (`/dev`, `/proc`, `/sys`, `/sdcard`, …), `-b`
-adds extra ones the same way proot does, and the target directory is created
-if the image lacks it:
+Besides the standard binds (`/dev`, `/proc`, `/sys`, `/sdcard`, …), `-b` adds
+extra ones, and the target directory is created if the image lacks it:
 
 ```sh
 rootlet -b /data/projects:/root/projects -b /opt/toolchain
