@@ -8,6 +8,7 @@
 #include <sched.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,21 +30,19 @@
 #define SESSION_DRAIN_MS 200
 #define MAX_BINDS 64
 
-/* An extra host path to bind into the chroot. "guest" is the absolute path
-   inside the tree; when the "-b host" form omits it, it equals "host". */
+/* A -b bind; "guest" is the path inside the tree, defaulting to "host". */
 struct bind {
   const char *host;
   const char *guest;
 };
 
 static char distro_path[PATH_MAX];
-/* Short enough that every subpath cp() appends to it still fits in PATH_MAX,
-   so no path this program builds is ever silently truncated. */
+/* Short enough that every subpath cp() appends still fits in PATH_MAX. */
 static char chroot_path[PATH_MAX - 256];
 static size_t chroot_len;
-/* The shallowest directory the teardown may remove: the mount point itself, or
-   the topmost parent this run had to create for it. */
-static size_t chroot_created;
+/* Shallowest directory the teardown may remove, and SIZE_MAX while this run
+   has created none: a mount point that was already there is left alone. */
+static size_t chroot_created = SIZE_MAX;
 static const char *su_path = DEFAULT_SU;
 static struct bind binds[MAX_BINDS];
 static size_t bind_count;
@@ -57,8 +56,8 @@ static int cleanup_done;
 static volatile sig_atomic_t session_gone;
 static volatile sig_atomic_t stop_signal;
 
-/* Build "<chroot_path><sub>" into one of a few rotating buffers, so a single
-   expression can safely hold more than one result at a time. */
+/* Build "<chroot_path><sub>" into one of a few rotating buffers, so one
+   expression can hold several results. */
 static const char *cp(const char *sub)
 {
   static char bufs[4][PATH_MAX];
@@ -89,9 +88,8 @@ static void die(const char *what)
   exit(1);
 }
 
-/* Creates every missing component of "path". When "created" is not NULL it is
-   lowered to the length of the shallowest component this call had to create;
-   components are made shallowest first, so only the first one can lower it. */
+/* Creates every missing component of "path". "created", when not NULL, is
+   lowered to the length of the shallowest component this call created. */
 static int mkdir_p(const char *path, size_t *created)
 {
   char buf[PATH_MAX];
@@ -172,8 +170,7 @@ static void loop_attach(void)
   if (img < 0)
     die(distro_path);
 
-  /* LOOP_CTL_GET_FREE only reserves a number, so a racing attach can
-     still take it before LOOP_SET_FD lands. */
+  /* GET_FREE only reserves a number; a racing attach can take it first. */
   for (attempt = 0; attempt < 16; attempt++) {
     int node;
 
@@ -211,8 +208,7 @@ static void loop_attach(void)
 
   dbg("attached %s -> %s", loop_node, distro_path);
 
-  /* Cosmetic: makes `losetup -l` show the backing file. The field is
-     fixed at LO_NAME_SIZE, so a longer path is simply truncated. */
+  /* Cosmetic: makes `losetup -l` show the backing file, truncated to fit. */
   memset(&info, 0, sizeof(info));
   name_len = strlen(distro_path);
   if (name_len >= sizeof(info.lo_file_name))
@@ -245,8 +241,7 @@ static int try_mount_rootfs(const char *type)
 
   dbg("try %s: %s", type, strerror(errno));
 
-  /* Anything else means the filesystem matched but the mount is not
-     possible, so probing further types is pointless. */
+  /* Anything else means the type matched but the mount cannot work. */
   if (errno != EINVAL && errno != ENODEV && errno != ENXIO)
     die("mount rootfs");
 
@@ -307,9 +302,9 @@ static void mount_soft(const char *source, const char *target,
     dbg("mount ok: %s", target);
 }
 
-/* Reports one path inside the image. Symlinks are shown rather than followed:
-   an absolute link resolves against the host from out here, so following it
-   would report a missing file for a binary that execs fine after the chroot. */
+/* Symlinks are shown, not followed: from out here an absolute link resolves
+   against the host, reporting a binary that execs fine after the chroot as
+   missing. */
 static void probe_path(const char *path)
 {
   char target[PATH_MAX];
@@ -336,8 +331,7 @@ static void probe_path(const char *path)
       (long long)st.st_size);
 }
 
-/* Debug-only survey of what the image actually contains, which is the
-   information needed when the session binary fails to exec. */
+/* What the image contains, for when the session binary fails to exec. */
 static void probe_rootfs(void)
 {
   struct dirent *ent;
@@ -365,9 +359,7 @@ static void probe_rootfs(void)
   probe_path(cp("/bin/su"));
 }
 
-/* User-requested binds from -b, applied after the fixed ones. The target
-   directory is created first so a bind onto a path the image lacks still
-   works, mirroring how /mnt/sdcard is handled. */
+/* The target is created first, so a bind onto a path the image lacks works. */
 static void mount_binds(void)
 {
   size_t i;
@@ -383,12 +375,9 @@ static void mount_binds(void)
   }
 }
 
-/* Serialize instances that share an image. Two concurrent runs would race in
-   do_mount/do_umount, and mounting the same read-write image twice corrupts
-   its filesystem. The advisory lock rides on the image's open file
-   description, so it releases automatically when this process exits or
-   crashes; O_CLOEXEC keeps it from leaking into the session's shell while the
-   main process holds it for the whole run. */
+/* Serialize runs sharing an image: mounting the same read-write image twice
+   corrupts it. The lock rides on the open file description, so it releases
+   even if this process crashes, and O_CLOEXEC keeps it out of the session. */
 static void acquire_lock(void)
 {
   int fd = open(distro_path, O_RDONLY | O_CLOEXEC);
@@ -409,8 +398,7 @@ static void acquire_lock(void)
   dbg("locked %s", distro_path);
 }
 
-/* mountinfo escapes space, tab, newline and backslash as octal, so a field has
-   to be decoded before it can be compared with a real path. */
+/* mountinfo escapes space, tab, newline and backslash as octal. */
 static void unescape_octal(char *s)
 {
   char *out = s;
@@ -429,11 +417,9 @@ static void unescape_octal(char *s)
   *out = '\0';
 }
 
-/* The image lock covers the image, not the directory it is mounted on, so two
-   runs with different images could stack on one mount point. The teardown of
-   whichever left first would then match the other session's processes by path
-   and kill them. Refusing a directory that is already a mount point avoids
-   that, and also catches what a run that was killed outright left behind. */
+/* The image lock does not cover the mount point, so two runs with different
+   images could stack on one. The teardown of whichever left first would then
+   kill the other session's processes, which it matches by path. */
 static int mount_point_busy(void)
 {
   char line[PATH_MAX * 2];
@@ -563,6 +549,9 @@ static void remove_mountpoint(void)
   char buf[PATH_MAX];
   size_t len = chroot_len;
 
+  if (chroot_created > chroot_len)     /* nothing here was ours to remove */
+    return;
+
   memcpy(buf, chroot_path, chroot_len + 1);
 
   for (;;) {
@@ -580,9 +569,8 @@ static void remove_mountpoint(void)
   }
 }
 
-/* Undoes whatever has been set up so far. Registered with atexit(), so a
-   die() once the image is attached still releases the loop device and the
-   mounts instead of leaving them behind. */
+/* Registered with atexit(), so a die() once the image is attached still
+   releases the loop device and the mounts. */
 static void cleanup(void)
 {
   if (cleanup_done)
@@ -604,12 +592,9 @@ static int path_in_chroot(const char *path)
          (path[chroot_len] == '/' || path[chroot_len] == '\0');
 }
 
-/* A process belongs to the session when its executable, root or working
-   directory lives inside the chroot, or when it merely keeps a descriptor
-   open there. The root/cwd/fd checks catch helpers exec'd from outside the
-   tree (or whose backing file was already unlinked) that would still pin
-   the mount and block umount. On a match, "match" holds the path that
-   matched, for logging. */
+/* Matches on exe, root, cwd or any open fd: a helper exec'd from outside the
+   tree, or one whose binary was unlinked, still pins the mount. "match" comes
+   back holding the path that matched. */
 static int belongs_to_chroot(pid_t pid, char *match, size_t match_size)
 {
   static const char *const links[] = { "exe", "root", "cwd" };
@@ -653,9 +638,7 @@ static int belongs_to_chroot(pid_t pid, char *match, size_t match_size)
   return 0;
 }
 
-/* The shell version forked one subshell per PID just to serialize
-   kill/sleep/kill; signalling every match first collapses that into a
-   single grace period. */
+/* Signal every match first, so they share one grace period. */
 static void kill_chroot_processes(void)
 {
   struct timespec grace = { TERM_GRACE_SECONDS, 0 };
@@ -735,8 +718,8 @@ static void on_winch(int sig)
   winch_pending = 1;
 }
 
-/* Both handlers only raise a flag: the teardown belongs on the main path, and
-   a stop signal must not skip it the way the default disposition would. */
+/* Only raise a flag: the teardown belongs on the main path, which the default
+   disposition would skip. */
 static void on_stop(int sig)
 {
   stop_signal = sig;
@@ -781,8 +764,7 @@ static void open_pty(int *master, int *slave)
   *master = fd;
 }
 
-/* Give the session its own controlling terminal, so job control, ^C and
-   ^Z belong to the inner shell instead of being shared with the caller. */
+/* So job control, ^C and ^Z belong to the inner shell, not the caller. */
 static void attach_pty(int slave)
 {
   if (setsid() < 0) {
@@ -879,10 +861,9 @@ static void relay(int master)
       push_window_size(master);
     }
 
-    /* The master only reports end of file once every slave is closed, and a
-       process the session left behind can hold one open for as long as it
-       likes. So once the session itself is gone, take what the pty still has
-       and leave; whatever is left running is dealt with by the caller. */
+    /* The master reports end of file only once every slave is closed, and a
+       leftover process can hold one open indefinitely. So once the session is
+       gone, take what the pty still has and leave. */
     if (session_gone && !draining) {
       clock_gettime(CLOCK_MONOTONIC, &drain_until);
       drain_until.tv_nsec += SESSION_DRAIN_MS * 1000000L;
@@ -936,9 +917,7 @@ static void relay(int master)
   signal(SIGWINCH, SIG_DFL);
 }
 
-/* Runs in the process that becomes the session: takes the pty as its
-   controlling terminal, enters the chroot, and execs the login program.
-   Never returns. */
+/* Never returns. */
 static void exec_session(int slave)
 {
   const char *base = strrchr(su_path, '/');
@@ -961,11 +940,9 @@ static void exec_session(int slave)
 
   dbg("chroot ok, exec %s", su_path);
 
-  /* Go straight to the syscall. A preloaded library inherited from the
-     launching shell (Termux's libtermux-exec) interposes execve() and
-     rewrites the path to a prefix that does not exist inside the chroot. It
-     is already mapped into this process, so clearing the environment above
-     cannot disarm it. */
+  /* Straight to the syscall: Termux's libtermux-exec interposes execve() and
+     rewrites the path to a prefix that does not exist inside the chroot. It is
+     already mapped here, so clearing the environment cannot disarm it. */
   syscall(SYS_execve, su_path, session_argv, environ);
 
   /* execve reports ENOENT both for a missing binary and for a binary whose
@@ -978,16 +955,16 @@ static void exec_session(int slave)
   _exit(126);
 }
 
-/* With -p the session runs in fresh PID and mount namespaces so it sees only
-   its own processes. unshare(CLONE_NEWPID) places the *next* child in the new
-   namespace as PID 1, so an intermediate fork is needed; that intermediate
-   stays in the host PID namespace to reap PID 1 and forward its exit status.
-   /proc must be remounted from inside the new PID namespace for `ps` to show
-   the container view, and the mount namespace is made private so that remount
-   does not propagate to the host. When the namespaces cannot be set up (e.g. a
-   kernel built without CONFIG_PID_NS), it warns and returns so the caller runs
-   a plain, non-isolated session rather than discarding the mount and pty setup
-   already done. */
+/* unshare(CLONE_NEWPID) places the *next* child in the new namespace as PID 1,
+   hence the intermediate fork: it stays behind to reap PID 1 and forward its
+   exit status. On failure this warns and returns, and the caller runs a plain
+   session on the mount and pty already set up.
+
+   The two unshares are separate, PID first, so giving up leaves this process
+   untouched. Combined, they failed without CONFIG_PID_NS but still cost the
+   caller the ability to resolve the mount point, and the plain session then
+   died in chroot(). Returning after CLONE_NEWNS fails is fine as well: the PID
+   namespace only takes effect for a child, and exec_session does not fork. */
 static void enter_namespaces(int slave)
 {
   pid_t leaf;
@@ -996,17 +973,24 @@ static void enter_namespaces(int slave)
   signal(SIGINT, SIG_IGN);
   signal(SIGQUIT, SIG_IGN);
 
-  if (unshare(CLONE_NEWNS | CLONE_NEWPID) != 0) {
+  if (unshare(CLONE_NEWPID) != 0) {
     if (errno == EINVAL)
-      fprintf(stderr, "unshare: %s (kernel built without "
+      fprintf(stderr, "unshare pid: %s (kernel built without "
         "CONFIG_PID_NS); continuing without namespace isolation\n",
         strerror(errno));
     else
-      fprintf(stderr, "unshare: %s; continuing without namespace "
+      fprintf(stderr, "unshare pid: %s; continuing without namespace "
         "isolation\n", strerror(errno));
     return;
   }
 
+  if (unshare(CLONE_NEWNS) != 0) {
+    fprintf(stderr, "unshare mount: %s; continuing without namespace "
+      "isolation\n", strerror(errno));
+    return;
+  }
+
+  /* Keeps the proc remount below from propagating to the host. */
   if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0)
     fprintf(stderr, "make private: %s\n", strerror(errno));
 
@@ -1026,14 +1010,13 @@ static void enter_namespaces(int slave)
     _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 125);
   }
 
-  /* leaf: PID 1 in the new namespace. Remount proc here so it reflects this
-     PID namespace instead of the host one already mounted by do_mount. */
+  /* leaf: PID 1 here. A proc mount reflects the mounter's PID namespace, so
+     this one has to replace the host's. */
   if (mount("proc", cp("/proc"), "proc", 0, NULL) != 0)
     fprintf(stderr, "mount proc: %s\n", strerror(errno));
 }
 
-/* Returns the status to exit with: the session's own, or 128 + signal when it
-   was killed or when a stop signal cut the session short. */
+/* Returns the status to exit with: the session's own, or 128 + signal. */
 static int run_session(void)
 {
   struct sigaction chld;
@@ -1043,9 +1026,8 @@ static int run_session(void)
 
   open_pty(&master, &slave);
 
-  /* Installed before the fork so a session that exits immediately cannot go
-     unnoticed and leave relay() waiting on the pty. SA_NOCLDSTOP keeps a
-     session that is merely stopped from counting as a finished one. */
+  /* Before the fork, so a session that exits at once cannot leave relay()
+     waiting on the pty. SA_NOCLDSTOP: merely stopped does not count. */
   memset(&chld, 0, sizeof(chld));
   chld.sa_handler = on_session_exit;
   chld.sa_flags = SA_NOCLDSTOP;
@@ -1058,6 +1040,10 @@ static int run_session(void)
 
   if (pid == 0) {
     close(master);
+    /* Report through the pty from here on: the inherited stderr races with the
+       raw mode the parent is about to enter, where a bare newline no longer
+       returns the carriage. */
+    dup2(slave, STDERR_FILENO);
     if (ns_enabled)
       enter_namespaces(slave);
     exec_session(slave);
@@ -1195,9 +1181,8 @@ int main(int argc, char **argv)
     }
   }
 
-  /* The chroot must be absolute: the process-cleanup scan matches it
-     against absolute /proc/<pid>/{exe,root,cwd} links. Trailing slashes
-     are dropped so path joins and the sibling-boundary check stay exact. */
+  /* Absolute because the cleanup scan matches it against /proc/<pid> links;
+     trailing slashes dropped so joins and the boundary check stay exact. */
   if (mount_at[0] != '/') {
     fprintf(stderr, "mount point must be absolute: %s\n", mount_at);
     return 1;
@@ -1216,7 +1201,6 @@ int main(int argc, char **argv)
   memcpy(chroot_path, mount_at, len);
   chroot_path[len] = '\0';
   chroot_len = len;
-  chroot_created = len;
 
   dbg("image=%s", distro_path);
   dbg("mount=%s", chroot_path);
