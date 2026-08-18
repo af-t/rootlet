@@ -484,60 +484,108 @@ static void do_mount(void)
   probe_rootfs();
 }
 
-static void umount_soft(const char *target)
+static int umount_soft(const char *target)
 {
-  if (umount2(target, 0) != 0)
+  if (umount2(target, 0) != 0) {
     fprintf(stderr, "umount %s: %s\n", target, strerror(errno));
-  else
-    dbg("umount ok: %s", target);
+    return -1;
+  }
+  dbg("umount ok: %s", target);
+  return 0;
 }
 
-static void umount_mnt_entries(void)
+/* mountinfo parsing shared with mount_point_busy(): the mount point is the
+   fifth space separated field, octal-escaped. Written into "out" and returns
+   1 when it falls strictly under chroot_path (chroot_path itself excluded,
+   that one is unmounted separately once everything below it is clear). */
+static int mount_entry_under_chroot(char *line, char *out, size_t out_size)
 {
-  char path[PATH_MAX];
-  struct dirent *ent;
-  DIR *dir;
+  char *field = line;
+  int i;
 
-  dir = opendir(cp("/mnt"));
-  if (!dir)
-    return;
+  for (i = 0; i < 4; i++) {
+    field += strcspn(field, " ");
+    field += strspn(field, " ");
+  }
+  field[strcspn(field, " \r\n")] = '\0';
+  unescape_octal(field);
 
-  while ((ent = readdir(dir)) != NULL) {
-    int n;
+  if (strncmp(field, chroot_path, chroot_len) != 0 || field[chroot_len] != '/')
+    return 0;
 
-    if (ent->d_name[0] == '.')
-      continue;
-    n = snprintf(path, sizeof(path), "%s/mnt/%s", chroot_path,
-           ent->d_name);
-    if (n < 0 || (size_t)n >= sizeof(path))
-      continue;
-    if (umount2(path, 0) == 0)
-      dbg("umount ok: %s", path);
+  snprintf(out, out_size, "%s", field);
+  return 1;
+}
+
+static int cmp_mount_len_desc(const void *a, const void *b)
+{
+  size_t la = strlen((const char *)a);
+  size_t lb = strlen((const char *)b);
+
+  return (la < lb) - (la > lb);
+}
+
+/* A session is free to mount something of its own inside the tree (no -p,
+   or -p without CONFIG_PID_NS), so unmounting cannot rely on a fixed list of
+   what rootlet itself made. Sweeps /proc/self/mountinfo for whatever is
+   still under chroot_path and clears it, deepest first, repeating until a
+   pass turns up nothing left. */
+static void unmount_stragglers(void)
+{
+  char (*paths)[PATH_MAX] = NULL;
+  size_t cap = 0;
+  int pass;
+
+  for (pass = 0; pass < 8; pass++) {
+    char line[PATH_MAX * 2];
+    size_t count = 0;
+    FILE *fp;
+
+    fp = fopen("/proc/self/mountinfo", "r");
+    if (!fp)
+      break;
+
+    while (fgets(line, sizeof(line), fp)) {
+      if (count == cap) {
+        size_t next = cap ? cap * 2 : 16;
+        char (*grown)[PATH_MAX] = realloc(paths, next * sizeof(*paths));
+
+        if (!grown)
+          break;
+        paths = grown;
+        cap = next;
+      }
+      if (mount_entry_under_chroot(line, paths[count], PATH_MAX))
+        count++;
+    }
+    fclose(fp);
+
+    if (count == 0)
+      break;
+
+    qsort(paths, count, PATH_MAX, cmp_mount_len_desc);
+
+    int progressed = 0;
+
+    for (size_t i = 0; i < count; i++) {
+      dbg("straggler mount: %s", paths[i]);
+      if (umount_soft(paths[i]) == 0)
+        progressed = 1;
+    }
+
+    /* Nothing came loose this pass: retrying would just repeat the same
+       errors, e.g. a directory that was already a mount point before rootlet
+       ran, now shadowed under the rootfs and unreachable to unmount. */
+    if (!progressed)
+      break;
   }
 
-  closedir(dir);
-}
-
-static void umount_binds(void)
-{
-  size_t i;
-
-  for (i = bind_count; i-- > 0; )
-    umount_soft(cp(binds[i].guest));
+  free(paths);
 }
 
 static void do_umount(void)
 {
-  umount_binds();
-
-  umount_mnt_entries();
-
-  umount_soft(cp("/dev/pts"));
-  umount_soft(cp("/dev"));
-  umount_soft(cp("/sys"));
-  umount_soft(cp("/proc"));
-  umount_soft(cp("/mnt"));
-  umount_soft(cp("/tmp"));
+  unmount_stragglers();
 
   umount_soft(chroot_path);
 }
@@ -556,8 +604,10 @@ static void remove_mountpoint(void)
 
   for (;;) {
     buf[len] = '\0';
-    if (rmdir(buf) != 0)
+    if (rmdir(buf) != 0) {
+      dbg("rmdir %s: %s", buf, strerror(errno));
       return;
+    }
 
     while (len > 0 && buf[len - 1] != '/')
       len--;
@@ -1087,6 +1137,27 @@ static int run_session(void)
   return WEXITSTATUS(status);
 }
 
+/* do_mount() mounts a -b bind at the literal joined path, unchrooted in the
+   host namespace, so a ".." component would resolve outside chroot_path
+   entirely -- and, since unmount_stragglers() only clears mounts it finds
+   under chroot_path, such a bind would then never get unmounted either. */
+static int has_dotdot_component(const char *path)
+{
+  const char *p = path;
+
+  while (*p) {
+    size_t len = strcspn(p, "/");
+
+    if (len == 2 && p[0] == '.' && p[1] == '.')
+      return 1;
+    p += len;
+    if (*p == '/')
+      p++;
+  }
+
+  return 0;
+}
+
 static void usage(const char *prog)
 {
   fprintf(stderr,
@@ -1142,6 +1213,11 @@ int main(int argc, char **argv)
       }
       if (binds[bind_count].guest[0] != '/') {
         fprintf(stderr, "bind target must be absolute: %s\n",
+          binds[bind_count].guest);
+        return 1;
+      }
+      if (has_dotdot_component(binds[bind_count].guest)) {
+        fprintf(stderr, "bind target must not contain '..': %s\n",
           binds[bind_count].guest);
         return 1;
       }
