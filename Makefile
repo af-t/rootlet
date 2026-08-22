@@ -9,10 +9,13 @@ SRC     := rootlet.c
 $(TARGET): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $(SRC)
 
+sudo: sudo.c
+	$(CC) $(CFLAGS) -o $@ sudo.c
+
 install: $(TARGET)
 	install -D -m 0755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/$(TARGET)
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) sudo
 
 .PHONY: install clean
