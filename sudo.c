@@ -44,6 +44,7 @@ struct sudo_req {
   unsigned short rows;
   unsigned short cols;
   int argc;
+  char cwd[PATH_MAX];
   char args[2048];
 };
 
@@ -285,7 +286,11 @@ static void daemonize(void)
 }
 
 /* Apply the client's environment into a root child, dropping LD_* so a caller
-   cannot inject a preload into the privileged exec. */
+   cannot inject a preload into the privileged exec, and TERMUX_EXEC__* since
+   the privileged exec runs without libtermux-exec (LD_PRELOAD is cleared) to
+   refresh it: a stale TERMUX_EXEC__PROC_SELF_EXE from the client would still
+   name the client's own binary, and a program that trusts it over a linker-
+   shadowed /proc/self/exe would misidentify itself. */
 static void apply_environment(const char *env_buf, uint32_t env_len)
 {
   const char *p = env_buf;
@@ -299,7 +304,8 @@ static void apply_environment(const char *env_buf, uint32_t env_len)
       break;
 
     const char *eq = memchr(p, '=', klen);
-    if (eq && strncmp(p, "LD_", 3) != 0) {
+    if (eq && strncmp(p, "LD_", 3) != 0 &&
+        strncmp(p, "TERMUX_EXEC__", 13) != 0) {
       size_t nlen = (size_t)(eq - p);
       char name[256];
 
@@ -370,6 +376,14 @@ static void run_child(struct sudo_req *req, char *env_buf, uint32_t env_size,
   if (env_buf)
     apply_environment(env_buf, env_size);
   drop_privileges(req);
+
+  if (!req->flag_i) {
+    size_t cwd_len = strnlen(req->cwd, sizeof(req->cwd));
+
+    if (cwd_len > 0 && cwd_len < sizeof(req->cwd) && chdir(req->cwd) != 0)
+      fprintf(stderr, "sudo: warning: could not change directory to %s: %s\n",
+              req->cwd, strerror(errno));
+  }
 
   /* Read SHELL only after the client's environment is in place. */
   shell = getenv("SHELL");
@@ -861,6 +875,9 @@ int main(int argc, char *argv[])
   req.uid = target_uid;
   req.gid = target_gid;
 
+  if (!getcwd(req.cwd, sizeof(req.cwd)))
+    req.cwd[0] = '\0';
+
   ptr = req.args;
   remaining = sizeof(req.args);
   n = 0;
@@ -877,6 +894,11 @@ int main(int argc, char *argv[])
     n++;
   }
   req.argc = n;
+
+  if (req.argc == 0 && !req.flag_i && !req.flag_s) {
+    fprintf(stderr, "Usage: sudo [-i] [-s] [-u user] [-g group] [command...]\n");
+    return 1;
+  }
 
   if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0) {
     req.rows = ws.ws_row;
