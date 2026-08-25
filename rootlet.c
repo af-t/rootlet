@@ -18,11 +18,13 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
-#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
 #include <linux/loop.h>
+
+#include "io.h"
+#include "tty.h"
 
 #define DEFAULT_MOUNT "/mnt/ubuntu"
 #define DEFAULT_SU "/usr/bin/su"
@@ -758,16 +760,6 @@ static void kill_chroot_processes(void)
   free(killed);
 }
 
-static struct termios saved_termios;
-static int termios_saved;
-static volatile sig_atomic_t winch_pending;
-
-static void on_winch(int sig)
-{
-  (void)sig;
-  winch_pending = 1;
-}
-
 /* Only raise a flag: the teardown belongs on the main path, which the default
    disposition would skip. */
 static void on_stop(int sig)
@@ -781,14 +773,7 @@ static void on_session_exit(int sig)
   session_gone = 1;
 }
 
-static void push_window_size(int master)
-{
-  struct winsize ws;
-
-  if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0)
-    ioctl(master, TIOCSWINSZ, &ws);
-}
-
+/* So job control, ^C and ^Z belong to the inner shell, not the caller. */
 static void open_pty(int *master, int *slave)
 {
   char name[PATH_MAX];
@@ -834,61 +819,6 @@ static void attach_pty(int slave)
     close(slave);
 }
 
-static void raw_mode_enter(void)
-{
-  struct termios raw;
-
-  if (!isatty(STDIN_FILENO))
-    return;
-  if (tcgetattr(STDIN_FILENO, &saved_termios) != 0)
-    return;
-
-  raw = saved_termios;
-  cfmakeraw(&raw);
-  if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == 0)
-    termios_saved = 1;
-}
-
-static void raw_mode_leave(void)
-{
-  if (!termios_saved)
-    return;
-
-  tcsetattr(STDIN_FILENO, TCSAFLUSH, &saved_termios);
-  termios_saved = 0;
-}
-
-static int write_all(int fd, const char *buf, size_t len)
-{
-  while (len > 0) {
-    ssize_t n = write(fd, buf, len);
-
-    if (n < 0) {
-      if (errno == EINTR)
-        continue;
-      return -1;
-    }
-
-    buf += n;
-    len -= (size_t)n;
-  }
-
-  return 0;
-}
-
-/* Milliseconds left until "deadline", never negative. */
-static int ms_until(const struct timespec *deadline)
-{
-  struct timespec now;
-  long ms;
-
-  clock_gettime(CLOCK_MONOTONIC, &now);
-  ms = (deadline->tv_sec - now.tv_sec) * 1000 +
-       (deadline->tv_nsec - now.tv_nsec) / 1000000;
-
-  return ms > 0 ? (int)ms : 0;
-}
-
 static void relay(int master)
 {
   struct timespec drain_until;
@@ -897,7 +827,7 @@ static void relay(int master)
   int stdin_open = 1;
   int draining = 0;
 
-  signal(SIGWINCH, on_winch);
+  winch_install();
 
   for (;;) {
     int timeout = -1;

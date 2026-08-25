@@ -23,6 +23,9 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 
+#include "io.h"
+#include "tty.h"
+
 #define SOCKET_PATH   "/data/data/com.termux/files/usr/tmp/.sudo.sock"
 #define LOCK_PATH     "/data/local/tmp/.sudo.lock"
 #define SERVER_FLAG   "--server-daemon"
@@ -48,11 +51,6 @@ struct sudo_req {
   char args[2048];
 };
 
-/* client terminal state */
-static struct termios orig_termios;
-static int raw_mode_active;
-static volatile sig_atomic_t winch_pending;
-
 /* server session tracking (main-loop only, never touched from a handler) */
 struct session {
   pid_t pid;
@@ -62,46 +60,6 @@ static struct session sessions[MAX_SESSIONS];
 static int n_sessions;
 static unsigned long total_served;
 static int sigchld_pipe[2] = { -1, -1 };
-
-static int write_all(int fd, const void *buf, size_t len)
-{
-  const char *p = buf;
-
-  while (len > 0) {
-    ssize_t n = write(fd, p, len);
-
-    if (n < 0) {
-      if (errno == EINTR)
-        continue;
-      return -1;
-    }
-    p += n;
-    len -= (size_t)n;
-  }
-
-  return 0;
-}
-
-static int read_all(int fd, void *buf, size_t len)
-{
-  char *p = buf;
-
-  while (len > 0) {
-    ssize_t n = read(fd, p, len);
-
-    if (n < 0) {
-      if (errno == EINTR)
-        continue;
-      return -1;
-    }
-    if (n == 0)
-      return -1;
-    p += n;
-    len -= (size_t)n;
-  }
-
-  return 0;
-}
 
 static int send_fd(int socket, int fd)
 {
@@ -196,57 +154,6 @@ static int parse_id(const char *s, unsigned *out)
 
   *out = (unsigned)v;
   return 0;
-}
-
-static int ms_until(const struct timespec *deadline)
-{
-  struct timespec now;
-  long ms;
-
-  clock_gettime(CLOCK_MONOTONIC, &now);
-  ms = (deadline->tv_sec - now.tv_sec) * 1000 +
-       (deadline->tv_nsec - now.tv_nsec) / 1000000;
-
-  return ms > 0 ? (int)ms : 0;
-}
-
-static void on_winch(int sig)
-{
-  (void)sig;
-  winch_pending = 1;
-}
-
-static void push_window_size(int master)
-{
-  struct winsize ws;
-
-  if (ioctl(STDIN_FILENO, TIOCGWINSZ, &ws) == 0)
-    ioctl(master, TIOCSWINSZ, &ws);
-}
-
-static void reset_terminal(void)
-{
-  if (raw_mode_active) {
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
-    raw_mode_active = 0;
-  }
-}
-
-static void set_raw_mode(void)
-{
-  struct termios raw;
-
-  if (!isatty(STDIN_FILENO))
-    return;
-  if (tcgetattr(STDIN_FILENO, &orig_termios) != 0)
-    return;
-
-  raw = orig_termios;
-  cfmakeraw(&raw);
-  if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == 0) {
-    raw_mode_active = 1;
-    atexit(reset_terminal);
-  }
 }
 
 static void sigchld_handler(int sig)
@@ -719,7 +626,6 @@ static int connect_server(void)
    remaining output. Returns the process exit code. */
 static int run_client(int socket_fd, int master_fd)
 {
-  struct sigaction sa;
   struct pollfd fds[3];
   struct timespec deadline;
   char buf[4096];
@@ -727,11 +633,9 @@ static int run_client(int socket_fd, int master_fd)
   int stdin_open = 1, master_eof = 0, status_recv = 0, ending = 0;
   int stdin_tty = isatty(STDIN_FILENO);
 
-  set_raw_mode();
+  raw_mode_enter();
 
-  memset(&sa, 0, sizeof(sa));
-  sa.sa_handler = on_winch;   /* no SA_RESTART: let poll see EINTR */
-  sigaction(SIGWINCH, &sa, NULL);
+  winch_install();
 
   for (;;) {
     int timeout = -1;
@@ -810,7 +714,7 @@ static int run_client(int socket_fd, int master_fd)
 
   close(master_fd);
   close(socket_fd);
-  reset_terminal();
+  raw_mode_leave();
 
   if (status_recv && raw_status != -1) {
     if (WIFSIGNALED(raw_status))

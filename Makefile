@@ -4,18 +4,22 @@ CFLAGS  += -Wall -Wextra -Werror
 PREFIX  ?= /usr/local
 
 TARGET  := rootlet
-SRC     := rootlet.c
+LIB     := io.o tty.o
+HDR     := io.h tty.h
 
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) -o $@ $(SRC)
+$(TARGET): rootlet.c $(LIB) $(HDR)
+	$(CC) $(CFLAGS) -o $@ rootlet.c $(LIB)
 
-sudo: sudo.c
-	$(CC) $(CFLAGS) -o $@ sudo.c
+sudo: sudo.c $(LIB) $(HDR)
+	$(CC) $(CFLAGS) -o $@ sudo.c $(LIB)
+
+$(LIB): %.o: %.c $(HDR)
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 install: $(TARGET)
 	install -D -m 0755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/$(TARGET)
 
 clean:
-	rm -f $(TARGET) sudo
+	rm -f $(TARGET) sudo *.o
 
 .PHONY: install clean
