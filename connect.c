@@ -235,6 +235,7 @@ static void *session_thread(void *arg)
   char     buf[4096];
   struct   pollfd pf[2];
   int      status = -1;
+  int      reaped = 0;
 
   free(sa);
 
@@ -246,6 +247,12 @@ static void *session_thread(void *arg)
 
   /* Relay loop: bridge master_fd <-> client_fd using packets. */
   for (;;) {
+    pid_t wp = waitpid(shell_pid, &status, WNOHANG);
+    if (wp > 0) {
+      reaped = 1;
+      break;
+    }
+
     pf[0].fd      = master_fd;
     pf[0].events  = POLLIN;
     pf[0].revents = 0;
@@ -287,10 +294,11 @@ static void *session_thread(void *arg)
     if (pf[1].revents & (POLLHUP | POLLERR)) break;
   }
 
-  /* Client disconnected or shell exited: ensure shell is gone. */
-  kill(shell_pid, SIGHUP);
-  if (waitpid(shell_pid, &status, 0) < 0)
-    status = -1;
+  if (!reaped) {
+    kill(shell_pid, SIGHUP);
+    if (waitpid(shell_pid, &status, 0) < 0)
+      status = -1;
+  }
 
   int32_t net_status = htonl((int32_t)status);
   send_pkt(client_fd, PKT_EXIT, &net_status, sizeof(net_status));
@@ -403,8 +411,11 @@ static void handle_connection(int server_fd)
   if (pthread_create(&tid, &attr, session_thread, sa) != 0) {
     free(sa);
     kill(shell_pid, SIGKILL);
+    waitpid(shell_pid, NULL, WNOHANG);
     close(master_fd);
     close(client_fd);
+    pthread_attr_destroy(&attr);
+    return;
   }
   pthread_attr_destroy(&attr);
 }
@@ -451,7 +462,6 @@ static void run_server(const char *host, int port, int foreground)
     daemonize();
 
   signal(SIGPIPE, SIG_IGN);
-  signal(SIGCHLD, SIG_DFL);
 
   for (;;) {
     struct pollfd pfd;
@@ -540,6 +550,9 @@ static int run_client_loop(int sock_fd)
         if (!stdin_tty) {
           char eof_char = 004;
           send_pkt(sock_fd, PKT_DATA, &eof_char, 1);
+        } else {
+          sock_open = 0;
+          shutdown(sock_fd, SHUT_WR);
         }
       } else {
         if (send_pkt(sock_fd, PKT_DATA, buf, (uint32_t)n) != 0)
