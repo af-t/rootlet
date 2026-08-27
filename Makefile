@@ -13,6 +13,9 @@ $(TARGET): rootlet.c $(LIB) $(HDR)
 sudo: sudo.c $(LIB) $(HDR)
 	$(CC) $(CFLAGS) -o $@ sudo.c $(LIB)
 
+connect: connect.c $(LIB) $(HDR)
+	$(CC) $(CFLAGS) -o $@ connect.c $(LIB) -lpthread
+
 $(LIB): %.o: %.c $(HDR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
@@ -20,6 +23,6 @@ install: $(TARGET)
 	install -D -m 0755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/$(TARGET)
 
 clean:
-	rm -f $(TARGET) sudo *.o
+	rm -f $(TARGET) sudo connect *.o
 
 .PHONY: install clean
